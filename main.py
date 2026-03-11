@@ -26,13 +26,20 @@ R2_ACCESS_KEY_ID = os.getenv("R2_ACCESS_KEY_ID", "")
 R2_SECRET_ACCESS_KEY = os.getenv("R2_SECRET_ACCESS_KEY", "")
 R2_BUCKET_NAME = os.getenv("R2_BUCKET_NAME", "x402-storage")
 
-s3 = boto3.client(
-    "s3",
-    endpoint_url=f"https://{R2_ACCOUNT_ID}.r2.cloudflarestorage.com",
-    aws_access_key_id=R2_ACCESS_KEY_ID,
-    aws_secret_access_key=R2_SECRET_ACCESS_KEY,
-    region_name="auto",
-)
+# Lazy S3 client — initialized on first use, not at startup
+_s3_client = None
+
+def get_s3():
+    global _s3_client
+    if _s3_client is None:
+        _s3_client = boto3.client(
+            "s3",
+            endpoint_url=f"https://{R2_ACCOUNT_ID}.r2.cloudflarestorage.com",
+            aws_access_key_id=R2_ACCESS_KEY_ID,
+            aws_secret_access_key=R2_SECRET_ACCESS_KEY,
+            region_name="auto",
+        )
+    return _s3_client
 
 
 @app.get("/")
@@ -55,6 +62,7 @@ def health():
         "price_per_mb": f"${PRICE_PER_MB}",
         "max_file_size_mb": MAX_FILE_SIZE_MB,
         "facilitator": FACILITATOR_URL,
+        "r2_configured": bool(R2_ACCOUNT_ID and R2_ACCESS_KEY_ID and R2_SECRET_ACCESS_KEY),
     }
 
 
@@ -75,7 +83,7 @@ async def store_file(file: UploadFile = File(...)):
         original_filename = file.filename or "unknown"
         content_type = file.content_type or "application/octet-stream"
 
-        s3.put_object(
+        get_s3().put_object(
             Bucket=R2_BUCKET_NAME,
             Key=file_id,
             Body=contents,
@@ -103,7 +111,7 @@ async def store_file(file: UploadFile = File(...)):
 @app.get("/retrieve/{file_id}")
 async def retrieve_file(file_id: str):
     try:
-        response = s3.get_object(Bucket=R2_BUCKET_NAME, Key=file_id)
+        response = get_s3().get_object(Bucket=R2_BUCKET_NAME, Key=file_id)
         content_type = response.get("ContentType", "application/octet-stream")
         original_filename = response.get("Metadata", {}).get("original_filename", file_id)
         body = response["Body"]
