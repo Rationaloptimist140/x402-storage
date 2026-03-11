@@ -1,0 +1,139 @@
+import os
+import uuid
+import boto3
+from fastapi import FastAPI, File, UploadFile, HTTPException
+from fastapi.responses import StreamingResponse
+from botocore.exceptions import ClientError
+from dotenv import load_dotenv
+
+try:
+    from x402.fastapi import require_payment
+except ImportError:
+    require_payment = None
+
+load_dotenv()
+
+app = FastAPI(title="x402 Storage", version="1.0.0")
+
+EVM_ADDRESS = os.getenv("EVM_ADDRESS", "")
+FACILITATOR_URL = os.getenv("FACILITATOR_URL", "https://x402.org/facilitator")
+NETWORK = os.getenv("NETWORK", "eip155:84532")
+PRICE_PER_MB = float(os.getenv("PRICE_PER_MB", "0.001"))
+MAX_FILE_SIZE_MB = 100
+
+R2_ACCOUNT_ID = os.getenv("R2_ACCOUNT_ID", "")
+R2_ACCESS_KEY_ID = os.getenv("R2_ACCESS_KEY_ID", "")
+R2_SECRET_ACCESS_KEY = os.getenv("R2_SECRET_ACCESS_KEY", "")
+R2_BUCKET_NAME = os.getenv("R2_BUCKET_NAME", "x402-storage")
+
+s3 = boto3.client(
+    "s3",
+    endpoint_url=f"https://{R2_ACCOUNT_ID}.r2.cloudflarestorage.com",
+    aws_access_key_id=R2_ACCESS_KEY_ID,
+    aws_secret_access_key=R2_SECRET_ACCESS_KEY,
+    region_name="auto",
+)
+
+
+@app.get("/")
+def root():
+    return {
+        "service": "x402-storage",
+        "status": "ok",
+        "description": "Pay-per-use file storage. $0.001/MB to store and retrieve.",
+        "endpoints": ["/store", "/retrieve/{file_id}", "/health"],
+    }
+
+
+@app.get("/health")
+def health():
+    return {
+        "status": "ok",
+        "service": "x402-storage",
+        "wallet": EVM_ADDRESS,
+        "network": NETWORK,
+        "price_per_mb": f"${PRICE_PER_MB}",
+        "max_file_size_mb": MAX_FILE_SIZE_MB,
+        "facilitator": FACILITATOR_URL,
+    }
+
+
+@app.post("/store")
+async def store_file(file: UploadFile = File(...)):
+    try:
+        contents = await file.read()
+        size_bytes = len(contents)
+        size_mb = size_bytes / (1024 * 1024)
+
+        if size_mb > MAX_FILE_SIZE_MB:
+            raise HTTPException(
+                status_code=400,
+                detail=f"File too large. Maximum {MAX_FILE_SIZE_MB}MB, got {size_mb:.2f}MB.",
+            )
+
+        file_id = str(uuid.uuid4())
+        original_filename = file.filename or "unknown"
+        content_type = file.content_type or "application/octet-stream"
+
+        s3.put_object(
+            Bucket=R2_BUCKET_NAME,
+            Key=file_id,
+            Body=contents,
+            ContentType=content_type,
+            Metadata={"original_filename": original_filename},
+        )
+
+        return {
+            "file_id": file_id,
+            "original_filename": original_filename,
+            "size_bytes": size_bytes,
+            "size_mb": round(size_mb, 4),
+            "content_type": content_type,
+            "retrieve_url": f"/retrieve/{file_id}",
+        }
+
+    except HTTPException:
+        raise
+    except ClientError:
+        raise HTTPException(status_code=500, detail="Storage backend error.")
+    except Exception:
+        raise HTTPException(status_code=500, detail="Unexpected error during upload.")
+
+
+@app.get("/retrieve/{file_id}")
+async def retrieve_file(file_id: str):
+    try:
+        response = s3.get_object(Bucket=R2_BUCKET_NAME, Key=file_id)
+        content_type = response.get("ContentType", "application/octet-stream")
+        original_filename = response.get("Metadata", {}).get("original_filename", file_id)
+        body = response["Body"]
+
+        return StreamingResponse(
+            body,
+            media_type=content_type,
+            headers={"Content-Disposition": f'attachment; filename="{original_filename}"'},
+        )
+
+    except ClientError as e:
+        error_code = e.response["Error"]["Code"]
+        if error_code == "NoSuchKey":
+            raise HTTPException(status_code=404, detail="File not found.")
+        raise HTTPException(status_code=500, detail="Storage backend error.")
+    except Exception:
+        raise HTTPException(status_code=500, detail="Unexpected error during retrieval.")
+
+
+if require_payment and EVM_ADDRESS:
+    app.add_middleware(
+        require_payment,
+        routes=[
+            {"path": "/store", "price": f"${PRICE_PER_MB}", "network": NETWORK, "address": EVM_ADDRESS},
+            {"path": "/retrieve/{file_id}", "price": f"${PRICE_PER_MB}", "network": NETWORK, "address": EVM_ADDRESS},
+        ],
+        facilitator_url=FACILITATOR_URL,
+    )
+
+if __name__ == "__main__":
+    import uvicorn
+    port = int(os.getenv("PORT", 8000))
+    uvicorn.run("main:app", host="0.0.0.0", port=port)
