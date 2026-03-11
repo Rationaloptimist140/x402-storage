@@ -7,9 +7,9 @@ from botocore.exceptions import ClientError
 from dotenv import load_dotenv
 
 try:
-    from x402.fastapi import require_payment
+    from x402.middleware.fastapi import x402_middleware
 except ImportError:
-    require_payment = None
+    x402_middleware = None
 
 load_dotenv()
 
@@ -131,14 +131,15 @@ async def retrieve_file(file_id: str):
         raise HTTPException(status_code=500, detail="Unexpected error during retrieval.")
 
 
-if require_payment and EVM_ADDRESS:
+# Apply x402 payment middleware if available
+if x402_middleware and EVM_ADDRESS:
     app.add_middleware(
-        require_payment,
-        routes=[
-            {"path": "/store", "price": f"${PRICE_PER_MB}", "network": NETWORK, "address": EVM_ADDRESS},
-            {"path": "/retrieve/{file_id}", "price": f"${PRICE_PER_MB}", "network": NETWORK, "address": EVM_ADDRESS},
-        ],
-        facilitator_url=FACILITATOR_URL,
+        x402_middleware,
+        wallet_address=EVM_ADDRESS,
+        routes={
+            "/store": {"price": str(PRICE_PER_MB), "network": NETWORK, "description": f"File storage - ${PRICE_PER_MB}/MB"},
+            "/retrieve/{file_id}": {"price": str(PRICE_PER_MB), "network": NETWORK, "description": f"File retrieval - ${PRICE_PER_MB}/MB"},
+        },
     )
 
 if __name__ == "__main__":
